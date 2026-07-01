@@ -1,0 +1,709 @@
+// ── Konstanta fisik robot ───────────────────────────────────────────────
+    const ROBOT_LEN_M = 0.25;
+    const ROBOT_WIDTH_M = 0.24;
+
+    // ── State global ───────────────────────────────────────────────────────
+    let ws = null, tool = 'pen';
+    let anchors = [];
+    let robot = null, scan = [], scanT = 0;
+    let mapImg = null, meta = null;
+    let vx = 0, vy = 0, vs = 1, ts = 1;
+    let pan = false, ps = { x: 0, y: 0 };
+    let poseArr = null;
+    let za = { x: 0, y: 0 }, zraf = null;
+    let mapRot = 0;
+    let measPts = [], measHover = null;
+    let suppressNextClick = false;
+    let poseSendLock = false;
+    let penDrag = null;
+    let sampleStepM = 0.05;
+    let cornerRound = false;
+    let cornerRadiusM = 0.50;
+
+    // ── Pose offset (AMCL vs odometry) ────────────────────────────────────
+    let poseOffset = null;   // {dyawDeg, dx, dy}
+    let lastRawStatus = null;   // {x, y, yaw_deg} odometry mentah terakhir
+
+    // Flag: bekukan updStatus agar tidak override posisi setelah drag pose
+    let poseJustSet = false;
+    let poseJustSetTimer = null;
+
+    function applyOffset(rawX, rawY, rawYawDeg) {
+      if (!poseOffset) return { x: rawX, y: rawY, yaw_deg: rawYawDeg };
+      const rad = poseOffset.dyawDeg * Math.PI / 180;
+      const rx = rawX * Math.cos(rad) - rawY * Math.sin(rad);
+      const ry = rawX * Math.sin(rad) + rawY * Math.cos(rad);
+      return { x: rx + poseOffset.dx, y: ry + poseOffset.dy, yaw_deg: rawYawDeg + poseOffset.dyawDeg };
+    }
+    function recomputeOffset(corrX, corrY, corrYawDeg) {
+      if (!lastRawStatus) { poseOffset = null; return; }
+      const dyawDeg = corrYawDeg - lastRawStatus.yaw_deg;
+      const rad = dyawDeg * Math.PI / 180;
+      const rx = lastRawStatus.x * Math.cos(rad) - lastRawStatus.y * Math.sin(rad);
+      const ry = lastRawStatus.x * Math.sin(rad) + lastRawStatus.y * Math.cos(rad);
+      poseOffset = { dyawDeg, dx: corrX - rx, dy: corrY - ry };
+    }
+    function inverseApplyOffset(mapX, mapY) {
+      if (!poseOffset) return { x: mapX, y: mapY };
+      const rx = mapX - poseOffset.dx;
+      const ry = mapY - poseOffset.dy;
+      const rad = -poseOffset.dyawDeg * Math.PI / 180;
+      return { x: rx * Math.cos(rad) - ry * Math.sin(rad), y: rx * Math.sin(rad) + ry * Math.cos(rad) };
+    }
+
+    // ── Canvas element ─────────────────────────────────────────────────────
+    const cvEl = document.getElementById('cv');
+    const ctx = cvEl.getContext('2d');
+
+    // ── Coord transforms ──────────────────────────────────────────────────
+    function mapToImgPx(mx, my) {
+      if (!mapImg || !meta) return { px: mx * 50, py: -my * 50 };
+      return { px: (mx - meta.ox) / meta.resolution, py: mapImg.naturalHeight - (my - meta.oy) / meta.resolution };
+    }
+    function imgPxToMap(px, py) {
+      if (!mapImg || !meta) return { x: px / 50, y: -py / 50 };
+      return { x: px * meta.resolution + meta.ox, y: (mapImg.naturalHeight - py) * meta.resolution + meta.oy };
+    }
+    function rotateImgPx(px, py, deg) {
+      if (!mapImg) return { px, py };
+      const cx = mapImg.naturalWidth / 2, cy = mapImg.naturalHeight / 2;
+      const rad = deg * Math.PI / 180, dx = px - cx, dy = py - cy;
+      return { px: cx + dx * Math.cos(rad) - dy * Math.sin(rad), py: cy + dx * Math.sin(rad) + dy * Math.cos(rad) };
+    }
+    function mapToCanvas(mx, my) {
+      const ip = mapToImgPx(mx, my), rp = rotateImgPx(ip.px, ip.py, mapRot);
+      return { px: rp.px * vs + vx, py: rp.py * vs + vy };
+    }
+    function canvasToMap(cx2, cy2) {
+      const ipx = (cx2 - vx) / vs, ipy = (cy2 - vy) / vs;
+      const un = rotateImgPx(ipx, ipy, -mapRot);
+      return imgPxToMap(un.px, un.py);
+    }
+    function pxPerMetre() { return (!meta) ? vs * 50 : vs / meta.resolution; }
+
+    // ── Bezier ────────────────────────────────────────────────────────────
+    function segCtrl(a, b) {
+      const p0 = { x: a.x, y: a.y }, p3 = { x: b.x, y: b.y };
+      return [p0, a.hOut ? { x: a.hOut.x, y: a.hOut.y } : p0, b.hIn ? { x: b.hIn.x, y: b.hIn.y } : p3, p3];
+    }
+    function isCornerA(a) { return !a.hIn && !a.hOut; }
+    function computeFillet(i) {
+      if (anchors.length < 3) return null;
+      const isLoop = Math.hypot(anchors[0].x - anchors[anchors.length-1].x, anchors[0].y - anchors[anchors.length-1].y) < 1e-5;
+      if (!isLoop && (i <= 0 || i >= anchors.length - 1)) return null;
+      
+      const V = anchors[i];
+      let P, N;
+      if (isLoop && (i === 0 || i === anchors.length - 1)) {
+        P = anchors[anchors.length - 2];
+        N = anchors[1];
+      } else {
+        P = anchors[i - 1];
+        N = anchors[i + 1];
+      }
+      
+      if (!isCornerA(V) || !V.round || P.hOut || N.hIn) return null;
+      let aDx = P.x - V.x, aDy = P.y - V.y; const aLen = Math.hypot(aDx, aDy);
+      let bDx = N.x - V.x, bDy = N.y - V.y; const bLen = Math.hypot(bDx, bDy);
+      if (aLen < 1e-6 || bLen < 1e-6) return null;
+      aDx /= aLen; aDy /= aLen; bDx /= bLen; bDy /= bLen;
+      const dot = Math.max(-1, Math.min(1, aDx * bDx + aDy * bDy));
+      const ang = Math.acos(dot);
+      if (ang < 1e-3 || Math.PI - ang < 1e-3) return null;
+      const half = ang / 2;
+      let r = cornerRadiusM, d = r / Math.tan(half);
+      const maxD = 0.49 * Math.min(aLen, bLen);
+      if (d > maxD) { d = maxD; r = d * Math.tan(half); }
+      const tA = { x: V.x + aDx * d, y: V.y + aDy * d }, tB = { x: V.x + bDx * d, y: V.y + bDy * d };
+      let biX = aDx + bDx, biY = aDy + bDy; const biLen = Math.hypot(biX, biY);
+      if (biLen < 1e-6) return null;
+      biX /= biLen; biY /= biLen;
+      const C = { x: V.x + biX * (r / Math.sin(half)), y: V.y + biY * (r / Math.sin(half)) };
+      let a0 = Math.atan2(tA.y - C.y, tA.x - C.x), a1 = Math.atan2(tB.y - C.y, tB.x - C.x);
+      let da = a1 - a0;
+      while (da > Math.PI) da -= 2 * Math.PI; while (da < -Math.PI) da += 2 * Math.PI;
+      const steps = Math.max(4, Math.ceil(Math.abs(da) / 0.18));
+      const arcPts = [];
+      for (let k = 0; k <= steps; k++) { const t = a0 + da * k / steps; arcPts.push({ x: C.x + r * Math.cos(t), y: C.y + r * Math.sin(t) }); }
+      return { tA, tB, arcPts, r };
+    }
+    function buildDense() {
+      if (anchors.length < 2) return [];
+      const fil = anchors.map((_, i) => computeFillet(i));
+      const out = [];
+      const push = p => { const L = out[out.length - 1]; if (!L || Math.hypot(L.x - p.x, L.y - p.y) > 1e-7) out.push(p); };
+      
+      if (fil[0]) {
+        push({ x: fil[0].tB.x, y: fil[0].tB.y });
+      } else {
+        push({ x: anchors[0].x, y: anchors[0].y });
+      }
+      for (let i = 0; i < anchors.length - 1; i++) {
+        const A = anchors[i], B = anchors[i + 1];
+        if (!A.hOut && !B.hIn) {
+          push(fil[i] ? fil[i].tB : { x: A.x, y: A.y });
+          push(fil[i + 1] ? fil[i + 1].tA : { x: B.x, y: B.y });
+        } else {
+          const [p0, p1, p2, p3] = segCtrl(A, B);
+          const approx = Math.hypot(p1.x - p0.x, p1.y - p0.y) + Math.hypot(p2.x - p1.x, p2.y - p1.y) + Math.hypot(p3.x - p2.x, p3.y - p2.y);
+          const Nn = Math.max(16, Math.ceil(approx / 0.03));
+          for (let k = 0; k <= Nn; k++) {
+            const t = k / Nn, mt = 1 - t, Aa = mt * mt * mt, Bb = 3 * mt * mt * t, Cc = 3 * mt * t * t, Dd = t * t * t;
+            push({ x: Aa * p0.x + Bb * p1.x + Cc * p2.x + Dd * p3.x, y: Aa * p0.y + Bb * p1.y + Cc * p2.y + Dd * p3.y });
+          }
+        }
+        if (fil[i + 1]) fil[i + 1].arcPts.forEach(push);
+      }
+      return out;
+    }
+    function densePath() { return buildDense(); }
+    function resample(poly, stepM) {
+      if (poly.length < 2) return poly.slice();
+      const out = [poly[0]]; let acc = 0;
+      for (let i = 1; i < poly.length; i++) {
+        let a = poly[i - 1], b = poly[i], segLen = Math.hypot(b.x - a.x, b.y - a.y);
+        while (acc + segLen >= stepM) {
+          const t = (stepM - acc) / segLen, np = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+          out.push(np); a = np; segLen = Math.hypot(b.x - a.x, b.y - a.y); acc = 0;
+        }
+        acc += segLen;
+      }
+      const last = poly[poly.length - 1];
+      if (Math.hypot(out[out.length - 1].x - last.x, out[out.length - 1].y - last.y) > 1e-6) out.push(last);
+      return out;
+    }
+    function sampleCurve(stepM) { return resample(buildDense(), stepM); }
+    function pathLengthM() {
+      const d = sampleCurve(Math.max(0.05, sampleStepM));
+      let L = 0; for (let i = 1; i < d.length; i++)L += Math.hypot(d[i].x - d[i - 1].x, d[i].y - d[i - 1].y);
+      return L;
+    }
+
+    // ── Grid step ─────────────────────────────────────────────────────────
+    function niceGridStep() {
+      const ppm = pxPerMetre(); if (ppm <= 0) return 1;
+      const rawM = 80 / ppm, pow = Math.pow(10, Math.floor(Math.log10(rawM)));
+      let best = pow, bestDiff = Infinity;
+      [1, 2, 5, 10].forEach(c => { const v = c * pow, d = Math.abs(v - rawM); if (d < bestDiff) { bestDiff = d; best = v; } });
+      return best;
+    }
+
+    // ── UI helpers ────────────────────────────────────────────────────────
+    function tc(id) { document.getElementById(id).classList.toggle('col'); }
+
+    // ── WebSocket ─────────────────────────────────────────────────────────
+    function toggleConn() {
+      if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); return; }
+      const url = document.getElementById('wsUrl').value.trim();
+      log(`Menghubungkan ke ${url}...`, 'in');
+      ws = new WebSocket(url);
+      ws.onopen = () => { setWS(true); log('Terhubung.', 'ok'); };
+      ws.onmessage = e => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.state !== undefined) updStatus(d);
+          if (d.type === 'robot_pose') updPose(d);
+          if (d.type === 'path_ack') log(d.data.status === 'ok' ? `✓ ${d.data.message}` : `✗ ${d.data.message}`, d.data.status === 'ok' ? 'ok' : 'er');
+          if (d.type === 'scan') updScan(d.points);
+        } catch (err) { }
+      };
+      ws.onclose = () => { setWS(false); log('Terputus.', 'er'); };
+      ws.onerror = () => { log('Error koneksi.', 'er'); };
+    }
+    function sw(o) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { log('Belum terhubung.', 'er'); return false; }
+      ws.send(JSON.stringify(o)); return true;
+    }
+
+    // ── Control ───────────────────────────────────────────────────────────
+    function closeLoop() {
+      if (anchors.length < 3) {
+        alert("Minimal butuh 3 titik untuk membuat loop.");
+        return;
+      }
+      
+      const first = anchors[0];
+      
+      // Ubah titik pertama menjadi rounded agar transisi putaran mulus
+      first.type = 'rounded';
+      first.round = true;
+      
+      // Push titik terakhir
+      anchors.push({ x: first.x, y: first.y, hIn: null, hOut: null, type: 'rounded', round: true });
+      
+      buildDense();
+      draw();
+      updAnchorList();
+      console.log("Jalur berhasil ditutup (Loop)");
+      log("Jalur berhasil ditutup (Loop)", "ok");
+    }
+
+    function sendPath() {
+      if (anchors.length < 2) { log('Minimal 2 anchor.', 'er'); return; }
+      const dense = sampleCurve(sampleStepM);
+      const pts = dense.map(p => { const raw = inverseApplyOffset(p.x, p.y); return { x: +raw.x.toFixed(4), y: +raw.y.toFixed(4) }; });
+      if (sw({ type: 'set_path', points: pts }))
+        log(`Mengirim ${pts.length} titik (${anchors.length} anchor · sampling ${(sampleStepM * 100).toFixed(0)}cm · ${pathLengthM().toFixed(2)}m)...`, 'in');
+    }
+    function cmd(c) {
+      if (c === 'rerun') { if (sw({ type: 'rerun' })) log('Ulangi jalur terakhir.', 'in'); }
+      else { if (sw({ cmd: c })) log(`Perintah: ${c}`, 'in'); }
+    }
+    function onSpd(v) { document.getElementById('spdV').textContent = parseFloat(v).toFixed(2); if (ws && ws.readyState === WebSocket.OPEN) sw({ cmd: 'set_speed', value: parseFloat(v) }); }
+    function onSmp(v) { sampleStepM = parseFloat(v); document.getElementById('smpV').textContent = (sampleStepM * 100).toFixed(0) + 'cm'; }
+    function onCornerRound(v) { cornerRound = v; anchors.forEach((a, i) => { if (!a.hIn && !a.hOut && i > 0 && i < anchors.length - 1) a.round = v; }); updAnchorList(); draw(); }
+    function onCornerRadius(v) { cornerRadiusM = parseFloat(v); document.getElementById('cradV').textContent = cornerRadiusM.toFixed(2); draw(); }
+    function toggleRound(i) { const a = anchors[i]; if (a && !a.hIn && !a.hOut) { a.round = !a.round; updAnchorList(); draw(); } }
+
+    function sendPose(x, y, yaw) {
+      if (sw({ type: 'pose_estimate', x, y, yaw })) {
+        log(`Pose: (${x.toFixed(2)},${y.toFixed(2)}) ${(yaw * 180 / Math.PI).toFixed(0)}°`, 'ok');
+      }
+      // Update robot langsung tanpa tunggu AMCL
+      if (!robot) robot = { x: 0, y: 0, yaw_deg: 0 };
+      robot.x = x; robot.y = y; robot.yaw_deg = yaw * 180 / Math.PI;
+      // Hitung offset baru berdasarkan posisi odometry terakhir
+      recomputeOffset(x, y, yaw * 180 / Math.PI);
+      // Bekukan updStatus 3 detik agar tidak override posisi baru
+      poseJustSet = true;
+      if (poseJustSetTimer) clearTimeout(poseJustSetTimer);
+      poseJustSetTimer = setTimeout(() => { poseJustSet = false; }, 3000);
+      document.getElementById('sX').textContent = x.toFixed(2);
+      document.getElementById('sY').textContent = y.toFixed(2);
+      document.getElementById('sH').textContent = (yaw * 180 / Math.PI).toFixed(0) + '°';
+      draw();
+    }
+
+    // ── Status callbacks ──────────────────────────────────────────────────
+    function updStatus(s) {
+      lastRawStatus = { x: s.x, y: s.y, yaw_deg: s.yaw_deg };
+      const c = applyOffset(s.x, s.y, s.yaw_deg);
+      document.getElementById('sX').textContent = s.x !== undefined ? c.x.toFixed(2) : '—';
+      document.getElementById('sY').textContent = s.y !== undefined ? c.y.toFixed(2) : '—';
+      document.getElementById('sH').textContent = s.yaw_deg !== undefined ? c.yaw_deg.toFixed(0) + '°' : '—';
+      document.getElementById('sW').textContent = (s.waypoint !== undefined && s.total_wp !== undefined) ? `${s.waypoint}/${s.total_wp}` : '—';
+      const b = document.getElementById('sBadge');
+      b.className = 'pill ' + (s.state || '');
+      b.innerHTML = '<span class="d"></span>' + (s.state || 'IDLE');
+      const ph = document.getElementById('sPhase');
+      if (s.phase === 'PIVOT') { ph.textContent = '↻ Memutar di tempat menuju arah waypoint'; ph.style.display = 'block'; }
+      else if (s.phase === 'FORWARD') { ph.textContent = '↑ Maju lurus menuju waypoint'; ph.style.display = 'block'; }
+      else { ph.style.display = 'none'; }
+      document.getElementById('obsWarn').style.display = s.obstacle ? 'flex' : 'none';
+
+      // Jangan update posisi di canvas kalau pose baru saja di-set manual
+      if (!poseJustSet) {
+        if (!robot) robot = { x: 0, y: 0, yaw_deg: 0 };
+        robot.x = c.x; robot.y = c.y; robot.yaw_deg = c.yaw_deg;
+      }
+      draw();
+    }
+
+    function updPose(d) {
+      // source='amcl' → recompute offset (lokalisasi terkoreksi)
+      // source='odom' → hanya update posisi di canvas, jangan ubah offset
+      if (d.source === 'amcl') {
+        recomputeOffset(d.x, d.y, d.yaw_deg);
+        if (!robot) robot = { x: 0, y: 0, yaw_deg: 0 };
+        robot.x = d.x; robot.y = d.y; robot.yaw_deg = d.yaw_deg;
+        document.getElementById('sX').textContent = d.x.toFixed(2);
+        document.getElementById('sY').textContent = d.y.toFixed(2);
+        document.getElementById('sH').textContent = d.yaw_deg.toFixed(0) + '°';
+      }
+      // source='odom' → diabaikan di sini, sudah ditangani updStatus
+      draw();
+    }
+
+    function updScan(p) { scan = p || []; scanT = Date.now(); draw(); }
+
+    // ── Map load ──────────────────────────────────────────────────────────
+    function loadMap(f) {
+      const r = new FileReader();
+      r.onload = e => { const img = new Image(); img.onload = () => { mapImg = img; resetView(); log('Peta dimuat.', 'ok'); }; img.src = e.target.result; };
+      r.readAsDataURL(f);
+    }
+    function loadYaml(f) {
+      const r = new FileReader();
+      r.onload = e => {
+        const t = e.target.result;
+        const res = parseFloat((t.match(/resolution:\s*([\d.eE+-]+)/) || [])[1] || 0.05);
+        const orig = (t.match(/origin:\s*\[([^\]]+)\]/) || ['', '0,0,0'])[1].split(',').map(Number);
+        meta = { resolution: res, ox: orig[0], oy: orig[1] };
+        log(`YAML: res=${res} m/px · origin=(${orig[0].toFixed(2)}, ${orig[1].toFixed(2)})`, 'ok');
+        draw();
+      };
+      r.readAsText(f);
+    }
+
+    // ── Map rotation ──────────────────────────────────────────────────────
+    function onRot(v) { mapRot = parseFloat(v); document.getElementById('rotV').textContent = Math.round(mapRot) + '°'; draw(); }
+    function rotStep(d) { mapRot = (mapRot + d + 360) % 360; document.getElementById('rot').value = mapRot; document.getElementById('rotV').textContent = Math.round(mapRot) + '°'; draw(); }
+    function rotReset() { mapRot = 0; document.getElementById('rot').value = 0; document.getElementById('rotV').textContent = '0°'; draw(); }
+
+    // ── Draw ──────────────────────────────────────────────────────────────
+    function resizeCv() {
+      const cw = document.getElementById('cw');
+      const W = cw.offsetWidth, H = cw.offsetHeight;
+      if (W > 0 && H > 0) { cvEl.width = W; cvEl.height = H; } draw();
+    }
+
+    function draw() {
+      const W = cvEl.width, H = cvEl.height; if (!W || !H) return;
+      ctx.clearRect(0, 0, W, H);
+      const showGrid = document.getElementById('tgG').checked;
+      const showRuler = document.getElementById('tgRl').checked;
+      const RULER_H = showRuler ? 22 : 0;
+
+      // Grid
+      if (showGrid) {
+        const stepM = niceGridStep(), stepPx = stepM / (meta ? meta.resolution : 1 / 50);
+        if (stepPx * vs > 3) {
+          ctx.save(); ctx.translate(vx, vy); ctx.scale(vs, vs);
+          if (mapImg) { const cx = mapImg.naturalWidth / 2, cy = mapImg.naturalHeight / 2; ctx.translate(cx, cy); ctx.rotate(mapRot * Math.PI / 180); ctx.translate(-cx, -cy); }
+          const half = Math.max(W, H) * 1.8 / vs;
+          const ocx = mapImg ? mapImg.naturalWidth / 2 : 0, ocy = mapImg ? mapImg.naturalHeight / 2 : 0;
+          ctx.strokeStyle = '#e2e6ec'; ctx.lineWidth = 1 / vs;
+          const x0 = ocx - half, x1 = ocx + half, y0 = ocy - half, y1 = ocy + half;
+          for (let x = Math.floor(x0 / stepPx) * stepPx; x < x1; x += stepPx) { ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke(); }
+          for (let y = Math.floor(y0 / stepPx) * stepPx; y < y1; y += stepPx) { ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke(); }
+          ctx.restore();
+        }
+      }
+
+      ctx.save();
+      ctx.translate(vx, vy); ctx.scale(vs, vs);
+      if (mapImg) { const cx = mapImg.naturalWidth / 2, cy = mapImg.naturalHeight / 2; ctx.translate(cx, cy); ctx.rotate(mapRot * Math.PI / 180); ctx.translate(-cx, -cy); }
+      if (mapImg) { ctx.globalAlpha = 0.92; ctx.drawImage(mapImg, 0, 0); ctx.globalAlpha = 1; }
+
+      // Lidar scan
+      if (document.getElementById('tgL').checked && scan.length && mapImg && meta && robot && (Date.now() - scanT < 2000)) {
+        const dr = 3.2 / vs;
+        const ryaw = (robot.yaw_deg || 0) * Math.PI / 180, cosY = Math.cos(ryaw), sinY = Math.sin(ryaw);
+        scan.forEach(p => {
+          const mapX = robot.x + (p.x * cosY - p.y * sinY), mapY = robot.y + (p.x * sinY + p.y * cosY);
+          const ip = mapToImgPx(mapX, mapY);
+          const d = Math.hypot(p.x, p.y);
+          ctx.fillStyle = d < 1 ? '#e3433f' : d < 2.5 ? '#f0a31c' : '#f6c945';
+          ctx.beginPath(); ctx.arc(ip.px, ip.py, dr, 0, Math.PI * 2); ctx.fill();
+        });
+      }
+
+      const showP = document.getElementById('tgP').checked;
+      const showW = document.getElementById('tgW').checked;
+
+      // Bezier path
+      if (showP && anchors.length >= 2) {
+        const dense = densePath();
+        if (dense.length >= 2) {
+          ctx.beginPath(); ctx.strokeStyle = '#f0a31c'; ctx.lineWidth = 3 / vs; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+          const i0 = mapToImgPx(dense[0].x, dense[0].y); ctx.moveTo(i0.px, i0.py);
+          for (let i = 1; i < dense.length; i++) { const p = mapToImgPx(dense[i].x, dense[i].y); ctx.lineTo(p.px, p.py); }
+          ctx.stroke();
+        }
+        const samp = sampleCurve(0.30);
+        for (let i = 2; i < samp.length - 1; i += 6) {
+          const a = mapToImgPx(samp[i].x, samp[i].y), b = mapToImgPx(samp[i + 1].x, samp[i + 1].y);
+          const ang = Math.atan2(b.py - a.py, b.px - a.px), as = 7 / vs;
+          ctx.save(); ctx.translate(a.px, a.py); ctx.rotate(ang);
+          ctx.fillStyle = '#f0a31c'; ctx.beginPath(); ctx.moveTo(as, 0); ctx.lineTo(-as * .6, as * .5); ctx.lineTo(-as * .6, -as * .5); ctx.closePath(); ctx.fill(); ctx.restore();
+        }
+      }
+
+      // Handles
+      if (tool === 'pen' && showW && anchors.length) {
+        anchors.forEach(a => {
+          const p = mapToImgPx(a.x, a.y);
+          ['hIn', 'hOut'].forEach(side => {
+            if (a[side]) {
+              const h = mapToImgPx(a[side].x, a[side].y);
+              ctx.strokeStyle = '#4f8ef0'; ctx.lineWidth = 1.2 / vs;
+              ctx.beginPath(); ctx.moveTo(p.px, p.py); ctx.lineTo(h.px, h.py); ctx.stroke();
+              ctx.beginPath(); ctx.arc(h.px, h.py, 3.6 / vs, 0, Math.PI * 2);
+              ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = '#4f8ef0'; ctx.lineWidth = 1.5 / vs; ctx.stroke();
+            }
+          });
+        });
+      }
+
+      // Anchor dots
+      if (showW && anchors.length) {
+        anchors.forEach((a, i) => {
+          const { px, py } = mapToImgPx(a.x, a.y), r = 6 / vs;
+          const isCorner = !a.hIn && !a.hOut;
+          const fill = i === 0 ? '#4caf50' : i === anchors.length - 1 ? '#4f8ef0' : '#f0a31c';
+          const halo = i === 0 ? 'rgba(76,175,80,.18)' : i === anchors.length - 1 ? 'rgba(79,142,240,.18)' : 'rgba(240,163,28,.18)';
+          ctx.beginPath(); ctx.arc(px, py, r + 2 / vs, 0, Math.PI * 2); ctx.fillStyle = halo; ctx.fill();
+          ctx.fillStyle = fill; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5 / vs;
+          const intC = isCorner && i > 0 && i < anchors.length - 1;
+          if (isCorner && intC && a.round) { ctx.beginPath(); rrPath(px - r, py - r, 2 * r, 2 * r, r * .9); ctx.fill(); ctx.stroke(); }
+          else if (isCorner) { ctx.fillRect(px - r, py - r, 2 * r, 2 * r); ctx.strokeRect(px - r, py - r, 2 * r, 2 * r); }
+          else { ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+          ctx.save(); ctx.translate(px, py); ctx.rotate(-mapRot * Math.PI / 180);
+          ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.max(8, 10 / vs)}px Segoe UI`;
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(i + 1, 0, 0); ctx.restore();
+        });
+      }
+
+      // Digital twin
+      if (document.getElementById('tgR').checked && robot && mapImg && meta) {
+        const { px, py } = mapToImgPx(robot.x, robot.y);
+        const yaw = (robot.yaw_deg || 0) * Math.PI / 180;
+        const Lpx = ROBOT_LEN_M / meta.resolution, Wpx = ROBOT_WIDTH_M / meta.resolution;
+        ctx.save(); ctx.translate(px, py); ctx.rotate(-yaw);
+        ctx.fillStyle = 'rgba(240,163,28,.10)'; ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, Lpx * 1.4, -0.5, 0.5); ctx.closePath(); ctx.fill();
+        const rr = Math.min(Lpx, Wpx) * 0.16;
+        ctx.beginPath(); rrPath(-Lpx / 2, -Wpx / 2, Lpx, Wpx, rr);
+        ctx.fillStyle = 'rgba(29,37,48,.88)'; ctx.fill(); ctx.strokeStyle = '#f0a31c'; ctx.lineWidth = Math.max(0.8, 1.6 / vs); ctx.stroke();
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1 / vs;
+        ctx.beginPath(); ctx.moveTo(-Lpx / 2, 0); ctx.lineTo(Lpx / 2, 0); ctx.stroke();
+        const ah = Math.min(Wpx, Lpx) * 0.32;
+        ctx.fillStyle = '#f0a31c'; ctx.beginPath(); ctx.moveTo(Lpx / 2, 0); ctx.lineTo(Lpx / 2 - ah, ah * .7); ctx.lineTo(Lpx / 2 - ah, -ah * .7); ctx.closePath(); ctx.fill();
+        ctx.restore();
+      }
+
+      // Pose arrow preview
+      if (tool === 'pose' && poseArr && poseArr.end) {
+        const ai = mapToImgPx(poseArr.sm.x, poseArr.sm.y), bi = mapToImgPx(poseArr.em.x, poseArr.em.y);
+        const ang = Math.atan2(bi.py - ai.py, bi.px - ai.px), as = 14 / vs;
+        ctx.save(); ctx.strokeStyle = '#4f8ef0'; ctx.lineWidth = 2.5 / vs;
+        ctx.beginPath(); ctx.moveTo(ai.px, ai.py); ctx.lineTo(bi.px, bi.py); ctx.stroke();
+        [ai, bi].forEach(p => { ctx.beginPath(); ctx.arc(p.px, p.py, 4 / vs, 0, Math.PI * 2); ctx.fillStyle = '#4f8ef0'; ctx.fill(); });
+        ctx.translate(bi.px, bi.py); ctx.rotate(ang);
+        ctx.fillStyle = '#4f8ef0'; ctx.beginPath(); ctx.moveTo(as, 0); ctx.lineTo(-as * .6, as * .5); ctx.lineTo(-as * .6, -as * .5); ctx.closePath(); ctx.fill(); ctx.restore();
+        const dist = Math.hypot(poseArr.em.x - poseArr.sm.x, poseArr.em.y - poseArr.sm.y);
+        const yd = (Math.atan2(poseArr.em.y - poseArr.sm.y, poseArr.em.x - poseArr.sm.x) * 180 / Math.PI).toFixed(1);
+        showFrd(`${dist.toFixed(3)} m / ${yd}°`);
+      } else if (tool === 'measure' && (measPts.length || measHover)) {
+        drawMeasurement();
+      } else if (tool === 'pen' && anchors.length >= 2) {
+        showFrd(`${anchors.length} anchor · ${pathLengthM().toFixed(2)} m`);
+      } else { hideFrd(); }
+
+      ctx.restore();
+      if (showRuler) drawRulers(W, H, RULER_H);
+      document.getElementById('zd').textContent = Math.round(vs * 100) + '%';
+    }
+
+    function rrPath(x, y, w, h, r) {
+      r = Math.min(r, w / 2, h / 2);
+      ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r);
+    }
+
+    // ── Rulers ────────────────────────────────────────────────────────────
+    function drawRulers(W, H, rh) {
+      const stepM = niceGridStep(), ppm = pxPerMetre(), stepPx = stepM * ppm;
+      if (stepPx < 4) return;
+      ctx.save();
+      ctx.fillStyle = 'rgba(255,255,255,.94)'; ctx.fillRect(0, 0, W, rh); ctx.fillRect(0, 0, rh, H);
+      ctx.strokeStyle = '#d6dadf'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, rh); ctx.lineTo(W, rh); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(rh, 0); ctx.lineTo(rh, H); ctx.stroke();
+      ctx.fillStyle = '#6b7280'; ctx.font = '9.5px Consolas,monospace'; ctx.textBaseline = 'middle';
+      const refC0 = mapToCanvas(0, 0);
+      const phaseX = ((refC0.px % stepPx) + stepPx) % stepPx;
+      ctx.textAlign = 'center';
+      for (let sx = phaseX; sx < W; sx += stepPx) {
+        if (sx < rh) continue;
+        const mapPt = canvasToMap(sx, H / 2);
+        ctx.beginPath(); ctx.moveTo(sx, rh - 6); ctx.lineTo(sx, rh); ctx.strokeStyle = '#9aa1ab'; ctx.stroke();
+        ctx.fillStyle = '#6b7280'; ctx.fillText(fmtM(snapLabel(mapPt.x, stepM)), sx, rh / 2 + 1);
+      }
+      const phaseY = ((refC0.py % stepPx) + stepPx) % stepPx;
+      ctx.textAlign = 'left';
+      for (let sy = phaseY; sy < H; sy += stepPx) {
+        if (sy < rh) continue;
+        const mapPt = canvasToMap(W / 2, sy);
+        ctx.beginPath(); ctx.moveTo(rh - 6, sy); ctx.lineTo(rh, sy); ctx.strokeStyle = '#9aa1ab'; ctx.stroke();
+        ctx.fillStyle = '#6b7280'; ctx.save(); ctx.translate(2, sy); ctx.fillText(fmtM(snapLabel(mapPt.y, stepM)), 2, 0); ctx.restore();
+      }
+      ctx.fillStyle = '#1d2530'; ctx.font = 'bold 9.5px Consolas,monospace'; ctx.textAlign = 'left';
+      ctx.fillText(fmtM(stepM), 4, rh / 2 + 1);
+      ctx.restore();
+    }
+    function snapLabel(val, stepM) { return Math.round(val / stepM) * stepM; }
+    function fmtM(v) {
+      if (Math.abs(v) < 1e-9) return '0';
+      if (Number.isInteger(v) || Math.abs(v) >= 10) return v.toFixed(0);
+      if (Math.abs(v) >= 1) return v.toFixed(1);
+      return v.toFixed(2);
+    }
+    function showFrd(t) { const e = document.getElementById('frd'); e.textContent = t; e.style.display = 'block'; }
+    function hideFrd() { document.getElementById('frd').style.display = 'none'; }
+
+    // ── Measurement ───────────────────────────────────────────────────────
+    function drawMeasurement() {
+      const allPts = measHover ? [...measPts, measHover] : measPts;
+      if (!allPts.length) return;
+      const imgPts = allPts.map(p => mapToImgPx(p.x, p.y));
+      ctx.save(); ctx.strokeStyle = '#0066cc'; ctx.lineWidth = 2 / vs; ctx.setLineDash([6 / vs, 4 / vs]);
+      ctx.beginPath(); ctx.moveTo(imgPts[0].px, imgPts[0].py); imgPts.slice(1).forEach(p => ctx.lineTo(p.px, p.py)); ctx.stroke(); ctx.setLineDash([]);
+      imgPts.forEach(p => { ctx.beginPath(); ctx.arc(p.px, p.py, 4 / vs, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.strokeStyle = '#0066cc'; ctx.lineWidth = 2 / vs; ctx.stroke(); });
+      let total = 0;
+      for (let i = 0; i < allPts.length - 1; i++) {
+        const a = allPts[i], b = allPts[i + 1], d = Math.hypot(b.x - a.x, b.y - a.y); total += d;
+        const ang = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+        const ia = imgPts[i], ib = imgPts[i + 1], mx = (ia.px + ib.px) / 2, my = (ia.py + ib.py) / 2;
+        ctx.save(); ctx.translate(mx, my); ctx.rotate(-mapRot * Math.PI / 180);
+        ctx.font = `bold ${Math.max(9, 11 / vs)}px Consolas,monospace`;
+        const txt = `${d.toFixed(3)} m · ${ang.toFixed(1)}°`, tw = ctx.measureText(txt).width;
+        ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.fillRect(-tw / 2 - 5 / vs, -9 / vs, tw + 10 / vs, 18 / vs);
+        ctx.fillStyle = '#004f9e'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(txt, 0, 0); ctx.restore();
+      }
+      ctx.restore();
+      if (allPts.length > 2) showFrd(`Total: ${total.toFixed(3)} m · ${allPts.length - 1} segmen`);
+      else if (allPts.length === 2) showFrd(`${total.toFixed(3)} m`);
+      else hideFrd();
+    }
+    function clearMeasure() { measPts = []; measHover = null; draw(); }
+
+    // ── Anchors ───────────────────────────────────────────────────────────
+    function undoLast() { if (anchors.length) { anchors.pop(); updAnchorList(); draw(); } }
+    function clearAll() { anchors = []; updAnchorList(); draw(); }
+    function delAnchor(i) { anchors.splice(i, 1); updAnchorList(); draw(); }
+
+    function updAnchorList() {
+      document.getElementById('wpN').textContent = anchors.length;
+      const l = document.getElementById('wpL');
+      if (!anchors.length) { l.innerHTML = '<div class="we">Belum ada titik. Pilih Pen, klik untuk corner, klik-drag untuk kurva.</div>'; return; }
+      l.innerHTML = anchors.map((a, i) => {
+        const isCorner = (!a.hIn && !a.hOut), interior = i > 0 && i < anchors.length - 1;
+        let typeHtml;
+        if (!isCorner) { typeHtml = `<span style="font-size:9px;color:var(--ink-faint);margin-left:4px">kurva</span>`; }
+        else if (interior) { const on = !!a.round; typeHtml = `<span onclick="toggleRound(${i})" style="cursor:pointer;font-size:9px;margin-left:4px;font-weight:${on ? '700' : '400'};color:${on ? 'var(--blue-dk)' : 'var(--ink-faint)'}">${on ? 'rounded' : 'corner'}</span>`; }
+        else { typeHtml = `<span style="font-size:9px;color:var(--ink-faint);margin-left:4px">corner</span>`; }
+        return `<div class="wi${i === 0 ? ' act' : ''}">` +
+          `<span class="wn">${i + 1}</span>` +
+          `<span class="wc">(${a.x.toFixed(2)}, ${a.y.toFixed(2)})</span>` +
+          typeHtml +
+          `<span class="wd" onclick="delAnchor(${i})">✕</span></div>`;
+      }).join('');
+      l.scrollTop = l.scrollHeight;
+    }
+
+    function hitAnchor(sx, sy) {
+      for (let i = anchors.length - 1; i >= 0; i--) { const s = mapToCanvas(anchors[i].x, anchors[i].y); if (Math.hypot(s.px - sx, s.py - sy) < 11) return i; } return -1;
+    }
+    function hitHandle(sx, sy) {
+      for (let i = anchors.length - 1; i >= 0; i--) { const a = anchors[i]; for (const side of ['hIn', 'hOut']) { if (a[side]) { const s = mapToCanvas(a[side].x, a[side].y); if (Math.hypot(s.px - sx, s.py - sy) < 9) return { i, side }; } } } return null;
+    }
+
+    function penDown(e) {
+      const sx = e.offsetX, sy = e.offsetY;
+      const h = hitHandle(sx, sy); if (h) { penDrag = { mode: 'handle', i: h.i, side: h.side }; suppressNextClick = true; return; }
+      const ai = hitAnchor(sx, sy); if (ai >= 0) { penDrag = { mode: 'anchor', i: ai }; suppressNextClick = true; return; }
+      const m = canvasToMap(sx, sy);
+      anchors.push({ x: m.x, y: m.y, hIn: null, hOut: null, round: cornerRound });
+      penDrag = { mode: 'new', i: anchors.length - 1, start: { x: m.x, y: m.y } }; suppressNextClick = true;
+      updAnchorList(); draw();
+    }
+    function penMove(e) {
+      if (!penDrag) return; const m = canvasToMap(e.offsetX, e.offsetY); const a = anchors[penDrag.i]; if (!a) { penDrag = null; return; }
+      if (penDrag.mode === 'new') {
+        const dx = m.x - penDrag.start.x, dy = m.y - penDrag.start.y;
+        const thresh = meta ? meta.resolution * 3 : 0.02;
+        if (Math.hypot(dx, dy) > thresh) { a.hOut = { x: a.x + dx, y: a.y + dy }; a.hIn = { x: a.x - dx, y: a.y - dy }; }
+        else { a.hOut = null; a.hIn = null; }
+      } else if (penDrag.mode === 'anchor') {
+        const dx = m.x - a.x, dy = m.y - a.y; a.x = m.x; a.y = m.y;
+        if (a.hIn) { a.hIn.x += dx; a.hIn.y += dy; } if (a.hOut) { a.hOut.x += dx; a.hOut.y += dy; }
+      } else if (penDrag.mode === 'handle') {
+        a[penDrag.side] = { x: m.x, y: m.y };
+        const other = penDrag.side === 'hIn' ? 'hOut' : 'hIn';
+        if (!e.altKey) a[other] = { x: 2 * a.x - m.x, y: 2 * a.y - m.y };
+      }
+      updAnchorList(); draw();
+    }
+    function penUp() { penDrag = null; }
+    function penDelete(e) { const ai = hitAnchor(e.offsetX, e.offsetY); if (ai >= 0) anchors.splice(ai, 1); else anchors.pop(); updAnchorList(); draw(); }
+
+    // ── Tool & view ───────────────────────────────────────────────────────
+    function setTool(t) {
+      tool = t;
+      const map = { pen: 'tDraw', pose: 'tPose', measure: 'tMeas', pan: 'tPan' };
+      Object.entries(map).forEach(([key, id]) => { const el = document.getElementById(id); if (!el) return; el.classList.toggle('act', key === t); if (id === 'tPose') el.classList.toggle('pose', key === t); });
+      cvEl.style.cursor = { pen: 'crosshair', pose: 'crosshair', measure: 'crosshair', pan: 'grab' }[t] || 'crosshair';
+      document.getElementById('hint').textContent = {
+        pen: 'Klik = corner · Klik-drag = kurva · Tarik handle = atur lengkung · Alt+handle = patahkan · Klik kanan = hapus',
+        pose: 'Klik tahan + drag = set posisi & arah robot',
+        measure: 'Klik = tambah titik ukur · Klik kanan = hapus titik terakhir · Esc = bersihkan',
+        pan: 'Klik tahan + drag = geser peta · Scroll = zoom'
+      }[t];
+      if (t !== 'measure') measHover = null; draw();
+    }
+    function resetView() {
+      if (mapImg) { const cw = document.getElementById('cw'); const sx = cw.clientWidth / mapImg.naturalWidth; const sy = cw.clientHeight / mapImg.naturalHeight; vs = Math.min(sx, sy) * .9; ts = vs; vx = (cw.clientWidth - mapImg.naturalWidth * vs) / 2; vy = (cw.clientHeight - mapImg.naturalHeight * vs) / 2; }
+      else { vx = 0; vy = 0; vs = 1; ts = 1; } draw();
+    }
+    function zoomStep(d) { const f = d > 0 ? 1.25 : .8; ts = Math.max(.05, Math.min(50, ts * f)); za = { x: cvEl.width / 2, y: cvEl.height / 2 }; if (!zraf) animZ(); }
+
+    cvEl.addEventListener('wheel', e => {
+      e.preventDefault();
+      const f = Math.exp(-(Math.max(-60, Math.min(60, e.deltaY)) / 60) * .12);
+      za = { x: e.offsetX, y: e.offsetY }; ts = Math.max(.05, Math.min(50, ts * f)); if (!zraf) animZ();
+    }, { passive: false });
+    function animZ() {
+      const d = ts - vs; if (Math.abs(d) < .0008) { vs = ts; draw(); zraf = null; return; }
+      const st = d * .28, ns = vs + st, f = ns / vs;
+      vx = za.x - (za.x - vx) * f; vy = za.y - (za.y - vy) * f; vs = ns; draw(); zraf = requestAnimationFrame(animZ);
+    }
+
+    // ── Canvas events ─────────────────────────────────────────────────────
+    cvEl.addEventListener('click', e => { if (suppressNextClick) { suppressNextClick = false; return; } if (tool === 'measure' && !pan) { measPts.push(canvasToMap(e.offsetX, e.offsetY)); draw(); } });
+    cvEl.addEventListener('contextmenu', e => { e.preventDefault(); if (tool === 'measure') { if (measPts.length) { measPts.pop(); draw(); } } else if (tool === 'pen') { penDelete(e); } else undoLast(); });
+    cvEl.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      if (tool === 'pan') { pan = true; ps = { x: e.offsetX - vx, y: e.offsetY - vy }; cvEl.style.cursor = 'grabbing'; }
+      if (tool === 'pose') { const m = canvasToMap(e.offsetX, e.offsetY); poseArr = { sm: m, em: m, end: false }; suppressNextClick = true; }
+      if (tool === 'pen') { penDown(e); }
+    });
+    cvEl.addEventListener('mousemove', e => {
+      const { x, y } = canvasToMap(e.offsetX, e.offsetY);
+      document.getElementById('coord').textContent = `x: ${x.toFixed(3)} · y: ${y.toFixed(3)}`;
+      if (pan) { vx = e.offsetX - ps.x; vy = e.offsetY - ps.y; draw(); }
+      if (tool === 'pose' && poseArr) { poseArr.em = canvasToMap(e.offsetX, e.offsetY); poseArr.end = true; draw(); }
+      if (tool === 'pen' && penDrag) { penMove(e); }
+      if (tool === 'measure' && measPts.length) { measHover = { x, y }; draw(); }
+    });
+    cvEl.addEventListener('mouseup', e => {
+      if (pan) { pan = false; if (tool === 'pan') cvEl.style.cursor = 'grab'; }
+      if (tool === 'pen' && penDrag) { penUp(); return; }
+      if (tool === 'pose' && poseArr) {
+        if (poseArr.end && !poseSendLock) {
+          poseSendLock = true;
+          const { x: sx, y: sy } = poseArr.sm, { x: ex, y: ey } = poseArr.em;
+          poseArr = null;
+          sendPose(sx, sy, Math.atan2(ey - sy, ex - sx));
+          draw(); setTool('pen');
+          setTimeout(() => { poseSendLock = false; }, 250);
+        } else { poseArr = null; suppressNextClick = false; }
+      }
+    });
+
+    // ── File drop & keyboard ──────────────────────────────────────────────
+    document.addEventListener('dragover', e => e.preventDefault());
+    document.addEventListener('drop', e => { e.preventDefault();[...e.dataTransfer.files].forEach(f => { if (f.name.endsWith('.yaml')) loadYaml(f); else if (f.name.match(/\.(pgm|png|jpg|jpeg)$/i)) loadMap(f); }); });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'o' && e.ctrlKey) { const inp = document.createElement('input'); inp.type = 'file'; inp.multiple = true; inp.accept = '.pgm,.png,.jpg,.jpeg,.yaml'; inp.onchange = () => [...inp.files].forEach(f => { if (f.name.endsWith('.yaml')) loadYaml(f); else loadMap(f); }); inp.click(); e.preventDefault(); }
+      if (e.key === 'z' && e.ctrlKey) undoLast();
+      if (e.key === 'Escape') { if (tool === 'measure') clearMeasure(); else { clearAll(); setTool('pen'); } }
+      if (e.key === 'd') setTool('pen'); if (e.key === 'p') setTool('pose'); if (e.key === 'm') setTool('measure');
+      if (e.key === '[') rotStep(-5); if (e.key === ']') rotStep(5);
+      if (e.key === ' ') { setTool(tool === 'pan' ? 'pen' : 'pan'); e.preventDefault(); }
+    });
+
+    // ── Log ───────────────────────────────────────────────────────────────
+    function log(msg, type = 'in') {
+      const b = document.getElementById('lb');
+      const cls = type === 'ok' ? 'ok' : type === 'er' ? 'er' : 'in';
+      const ts = new Date().toLocaleTimeString('id', { hour12: false });
+      b.innerHTML += `<div class="${cls}"><span class="lts">[${ts}]</span> ${msg}</div>`;
+      b.scrollTop = b.scrollHeight; while (b.children.length > 60) b.removeChild(b.firstChild);
+    }
+    function setWS(c) { document.getElementById('wsDot').className = 'ws-dot' + (c ? ' on' : ''); document.getElementById('wsLabel').textContent = c ? 'Terhubung' : 'Tidak terhubung'; }
+
+    // ── Init ──────────────────────────────────────────────────────────────
+    const ro = new ResizeObserver(() => resizeCv());
+    ro.observe(document.getElementById('cw'));
+    resizeCv(); updAnchorList();
+    log('Path Editor Bezier siap. Drag &amp; drop peta.png + peta.yaml ke canvas.', 'in');
+    log('Ctrl+O = buka file · D = pen · P = pose · M = ukur · Spasi = pan · [ ] = rotasi', 'in');

@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+  <script src="https://static.robotwebtools.org/roslibjs/current/roslib.min.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Polebot AGV — Path Editor (Bezier)</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+  <header>
+    <div class="logo">
+      <div class="logo-icon">P</div>POLEBOT
+    </div>
+    <div class="hdiv"></div>
+    <div class="htitle">AGV Path Editor · Bezier</div>
+    <div class="ws-status">
+      <div class="ws-dot" id="wsDot"></div><span id="wsLabel">Tidak terhubung</span>
+    </div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="card" id="cConn">
+        <div class="ch" onclick="tc('cConn')">
+          <h3>Koneksi Robot</h3><span class="cv">▾</span>
+        </div>
+        <div class="cb">
+          <div class="ir">
+            <input type="text" id="wsUrl" value="ws://192.168.137.40:9090" placeholder="ws://jetson-ip:9090">
+            <button onclick="toggleConn()">Hubungkan</button>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="cStatus">
+        <div class="ch" onclick="tc('cStatus')">
+          <h3>Status Robot</h3><span class="cv">▾</span>
+        </div>
+        <div class="cb">
+          <div class="msg">
+            <div class="ms">
+              <div class="l">X (m)</div>
+              <div class="v" id="sX">—</div>
+            </div>
+            <div class="ms">
+              <div class="l">Y (m)</div>
+              <div class="v" id="sY">—</div>
+            </div>
+            <div class="ms">
+              <div class="l">Heading</div>
+              <div class="v" id="sH">—</div>
+            </div>
+            <div class="ms">
+              <div class="l">Waypoint</div>
+              <div class="v" id="sW">—</div>
+            </div>
+          </div>
+          <span class="pill" id="sBadge"><span class="d"></span>IDLE</span>
+          <div class="ht" id="sPhase" style="display:none;margin-top:6px;font-weight:600;color:var(--blue-dk)"></div>
+          <div class="obs" id="obsWarn">⚠ Obstacle</div>
+        </div>
+      </div>
+      <div class="card" id="cCtrl">
+        <div class="ch" onclick="tc('cCtrl')">
+          <h3>Kontrol</h3><span class="cv">▾</span>
+        </div>
+        <div class="cb">
+          <button class="btn pri" onclick="sendPath()">▶ Jalankan Jalur</button>
+          <button class="btn" onclick="cmd('pause')">⏸ Pause</button>
+          <button class="btn suc" onclick="cmd('resume')">▶ Resume</button>
+          <button class="btn" onclick="cmd('rerun')">↺ Ulangi Jalur Terakhir</button>
+          <button class="btn dan" onclick="cmd('stop')">■ Stop + Hapus Jalur</button>
+          <button class="btn" onclick="closeLoop()">🔗 Tutup Jalur (Loop)</button>
+          <div class="fr">
+            <label>Kecepatan</label>
+            <input type="range" id="spd" min="0.1" max="0.8" step="0.05" value="0.40" oninput="onSpd(this.value)">
+            <span class="fv" id="spdV">0.40</span>
+          </div>
+          <div class="sd">
+            <div class="sl">Pen Tool — Kurva Bezier</div>
+            <div class="ht" style="padding:8px 0 2px;"><b>Klik</b> = titik sudut (corner, pivot).<br><b>Klik + drag</b>
+              = titik kurva mulus (anchor Bezier).<br>Tarik handle biru untuk atur lengkung.</div>
+            <div class="legend"><span class="lg-sq"></span>corner (patah)<span style="width:8px"></span><span
+                class="lg-ci"></span>kurva (mulus)</div>
+            <div class="tr" style="margin-top:6px"><label>Bulatkan sudut</label><label class="tog"><input
+                  type="checkbox" id="tgRound" onchange="onCornerRound(this.checked)"><span class="ts"></span></label>
+            </div>
+            <div class="fr">
+              <label>Radius</label>
+              <input type="range" id="crad" min="0.2" max="1.0" step="0.05" value="0.50"
+                oninput="onCornerRadius(this.value)">
+              <span class="fv" id="cradV">0.50</span>
+            </div>
+            <div class="ht">Corner difillet jadi busur tangen berradius tetap.</div>
+            <div class="fr" style="margin-top:8px">
+              <label>Sampling</label>
+              <input type="range" id="smp" min="0.02" max="0.20" step="0.01" value="0.05" oninput="onSmp(this.value)">
+              <span class="fv" id="smpV">5cm</span>
+            </div>
+            <div class="ht">Jarak antar titik padat yang dikirim ke ROS untuk perhitungan CTE.</div>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="cView">
+        <div class="ch" onclick="tc('cView')">
+          <h3>Tampilan</h3><span class="cv">▾</span>
+        </div>
+        <div class="cb">
+          <div class="tr"><label>Scan Lidar</label><label class="tog"><input type="checkbox" id="tgL" checked
+                onchange="draw()"><span class="ts"></span></label></div>
+          <div class="tr"><label>Digital Twin</label><label class="tog"><input type="checkbox" id="tgR" checked
+                onchange="draw()"><span class="ts"></span></label></div>
+          <div class="tr"><label>Jalur</label><label class="tog"><input type="checkbox" id="tgP" checked
+                onchange="draw()"><span class="ts"></span></label></div>
+          <div class="tr"><label>Anchor &amp; Handle</label><label class="tog"><input type="checkbox" id="tgW" checked
+                onchange="draw()"><span class="ts"></span></label></div>
+          <div class="tr"><label>Grid &amp; Skala</label><label class="tog"><input type="checkbox" id="tgG" checked
+                onchange="draw()"><span class="ts"></span></label></div>
+          <div class="tr"><label>Ruler Tepi</label><label class="tog"><input type="checkbox" id="tgRl" checked
+                onchange="draw()"><span class="ts"></span></label></div>
+          <div class="sd" style="margin-top:6px">
+            <div class="sl">Rotasi Peta</div>
+            <div class="fr">
+              <label>Sudut</label>
+              <input type="range" id="rot" min="0" max="359" step="1" value="0" oninput="onRot(this.value)">
+              <span class="fv" id="rotV">0°</span>
+            </div>
+            <div style="display:flex;gap:6px;margin-top:7px">
+              <button class="btn" style="margin-bottom:0;flex:1;justify-content:center" onclick="rotStep(-90)">⟲
+                -90°</button>
+              <button class="btn" style="margin-bottom:0;flex:1;justify-content:center" onclick="rotStep(90)">⟳
+                +90°</button>
+            </div>
+            <button class="btn" style="margin-top:6px" onclick="rotReset()">↺ Reset Rotasi</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+    <div class="viewer">
+      <div class="vtop">
+        <div class="tg">
+          <button class="ib act" id="tDraw" onclick="setTool('pen')" title="Pen Tool (Bezier)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 19l7-7 3 3-7 7-3-3z" />
+              <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" />
+            </svg>
+          </button>
+          <button class="ib" id="tPose" onclick="setTool('pose')" title="2D Pose Estimate">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 3v4M12 17v4M3 12h4M17 12h4" />
+              <path d="M12 12l5-2" />
+            </svg>
+          </button>
+          <button class="ib" id="tMeas" onclick="setTool('measure')" title="Ukur Jarak &amp; Sudut">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 17L17 3" />
+              <path d="M7 21l-4-4M11 17l-4-4M15 13l-4-4M19 9l-4-4" />
+              <path d="M3 21h4M17 3h4v4" />
+            </svg>
+          </button>
+          <button class="ib" id="tPan" onclick="setTool('pan')" title="Geser Peta">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20" />
+            </svg>
+          </button>
+        </div>
+        <div class="tg c">
+          <button class="ib" onclick="resetView()" title="Reset View">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <path d="M9 9h6v6H9z" />
+            </svg>
+          </button>
+          <button class="ib" onclick="undoLast()" title="Undo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 12a9 9 0 1 0 3-6.7" />
+              <path d="M3 4v5h5" />
+            </svg>
+          </button>
+        </div>
+        <div class="tg">
+          <button class="ib" onclick="zoomStep(1)" title="Zoom In">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M21 21l-4.3-4.3M11 8v6M8 11h6" />
+            </svg>
+          </button>
+          <button class="ib" onclick="zoomStep(-1)" title="Zoom Out">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M21 21l-4.3-4.3M8 11h6" />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div class="cw" id="cw">
+        <canvas id="cv"></canvas>
+        <div class="frd" id="frd"></div>
+        <div class="hint" id="hint">Klik = corner · Klik-drag = kurva · Klik kanan = hapus · Scroll = zoom</div>
+        <div class="coord" id="coord">x: — · y: —</div>
+        <div class="zoom" id="zd">100%</div>
+      </div>
+    </div>
+    <aside class="sidebar right">
+      <div class="card" id="cWp" style="display:flex;flex-direction:column;flex:1;min-height:0">
+        <div class="ch" onclick="tc('cWp')">
+          <h3>Anchor (<span id="wpN">0</span>)</h3><span class="cv">▾</span>
+        </div>
+        <div class="cb" style="overflow-y:auto">
+          <div style="display:flex;justify-content:flex-end;margin-bottom:7px">
+            <span style="font-size:11px;color:var(--red);cursor:pointer;font-weight:600" onclick="clearAll()">Hapus
+              Semua</span>
+          </div>
+          <div class="wl" id="wpL">
+            <div class="we">Belum ada titik. Pilih Pen, klik untuk corner, klik-drag untuk kurva.</div>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="cLog">
+        <div class="ch" onclick="tc('cLog')">
+          <h3>Log</h3><span class="cv">▾</span>
+        </div>
+        <div class="cb">
+          <div class="lb" id="lb"></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+
+</html>
