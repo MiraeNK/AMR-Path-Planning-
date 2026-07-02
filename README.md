@@ -1,4 +1,4 @@
-# 🤖 Polebot AGV — Path Editor (Bezier)
+# Polebot AGV — Path Editor (Bezier)
 
 > Web-based path planning GUI for AMR (Autonomous Mobile Robots) using Bezier curves, with real-time ROS connectivity via WebSocket.
 
@@ -8,7 +8,7 @@
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
 - [Overview](#-overview)
 - [Key Features](#-key-features)
@@ -25,7 +25,7 @@
 
 ---
 
-## 🔍 Overview
+## Overview
 
 **Polebot AGV Path Editor** is a web-based interface for visually planning and controlling AGV/AMR robot paths. Operators can draw paths using a **Pen Tool** powered by cubic Bezier curves, monitor the robot's position in real-time (Digital Twin), and send control commands through a WebSocket connection to ROS (Robot Operating System).
 
@@ -45,9 +45,9 @@
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-### 🖊️ Pen Tool (Bezier Path Drawing)
+### Pen Tool (Bezier Path Drawing)
 | Action | Result |
 |--------|--------|
 | **Click** | Creates a corner point (sharp pivot) |
@@ -56,44 +56,44 @@
 | **Alt + Drag handle** | Breaks handle symmetry (independent control) |
 | **Right-click** | Deletes the last anchor or the one clicked |
 
-### 🔄 Corner Rounding (Fillet)
+### Corner Rounding (Fillet)
 - Automatically converts sharp corners into tangent arcs with a fixed radius
 - Adjustable radius (0.20 m – 1.00 m)
 - Toggle per-corner or all at once
 
-### 🗺️ Map & Navigation
+### Map & Navigation
 - Drag & drop `.png`/`.pgm` map files + `.yaml` metadata (ROS map_server format)
 - Smooth animated zoom (scroll wheel)
 - Pan (drag to move the map)
 - Map rotation (0° – 359°) with ±90° buttons and slider
 - Auto-scaling grid & rulers
 
-### 🤖 Digital Twin
+### Digital Twin
 - Displays the robot's real-time position and heading overlaid on the map
 - Robot visualized as a box with a heading arrow
 - Field of view indicator
 
-### 📡 Lidar Scan Visualization
+### Lidar Scan Visualization
 - Displays real-time Lidar scan points from the robot
 - Color-coded by distance (red < 1m, orange < 2.5m, yellow > 2.5m)
 - Auto-expires after 2 seconds without updates
 
-### 🎯 2D Pose Estimate
+### 2D Pose Estimate
 - Manually set the robot's position and orientation on the map
 - Click-drag to define position (click) and heading direction (drag)
 - Computes the transformation offset between odometry and map position
 
-### 📏 Measurement Tool
+### Measurement Tool
 - Measure distances between points on the map
 - Multi-segment measurement support
 - Shows distance (meters) and angle per segment
 
-### 🔗 Loop Path & Continuous Patrol
+### Loop Path & Continuous Patrol
 - Close any path into a loop with a single click
 - **Continuous Mode**: robot patrols indefinitely
 - **Single Loop Mode**: robot stops after one loop
 
-### 📊 Status & Control
+### Status & Control
 - WebSocket connection status indicator (connected/disconnected)
 - Robot position: X, Y, Heading
 - Current waypoint progress
@@ -103,7 +103,7 @@
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -136,7 +136,7 @@
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```
 AGV AMR/
@@ -167,7 +167,7 @@ Both versions provide **identical functionality**.
 
 ---
 
-## 📦 JavaScript Modules
+## JavaScript Modules
 
 ### Dependency Graph
 
@@ -370,7 +370,7 @@ Registers all event listeners on the canvas and document:
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 - A modern browser (Chrome, Firefox, Edge) with ES6 Module support
@@ -407,7 +407,7 @@ ws://<jetson-ip>:9090
 
 ---
 
-## 📖 Usage Guide
+## Usage Guide
 
 ### 1. Loading a Map
 
@@ -456,7 +456,7 @@ Only `resolution` and `origin` are used by the GUI.
 ### 5. Loop & Continuous Patrol
 
 1. Draw a path with at least 3 points
-2. Click **"🔗 Tutup Jalur (Loop)"** (Close Path Loop)
+2. Click **" Tutup Jalur (Loop)"** (Close Path Loop)
 3. Choose a mode:
    - **Continuous**: Robot loops indefinitely
    - **Single**: Robot stops after one complete loop
@@ -470,7 +470,7 @@ Only `resolution` and `origin` are used by the GUI.
 
 ---
 
-## 📡 WebSocket Protocol
+## WebSocket Protocol
 
 ### Messages Sent (GUI → Robot)
 
@@ -575,7 +575,7 @@ Only `resolution` and `origin` are used by the GUI.
 
 ---
 
-## ⌨️ Keyboard Shortcuts
+## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
@@ -592,7 +592,7 @@ Only `resolution` and `origin` are used by the GUI.
 
 ---
 
-## ⚙️ Robot Configuration
+## Robot Configuration
 
 Robot physical constants are defined in `js/state.js`:
 
@@ -612,7 +612,7 @@ Default parameters:
 
 ---
 
-## 🧭 Coordinate System
+## Coordinate System
 
 ### Map Coordinate Frame
 - **X positive** = right
@@ -636,7 +636,7 @@ Paths sent to the robot are always in the **odometry frame** (the inverse transf
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Blank page / errors when opening `index.html`
 **Cause:** Browser blocks ES6 module imports from `file://` protocol.  
@@ -675,7 +675,7 @@ roslaunch rosbridge_server rosbridge_websocket.launch
 
 ---
 
-## 📄 License
+## License
 
 MIT License
 
