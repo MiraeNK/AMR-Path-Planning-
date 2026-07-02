@@ -1209,8 +1209,21 @@
       buildDense();
       draw();
       updAnchorList();
-      console.log("Jalur berhasil ditutup (Loop)");
-      log("Jalur berhasil ditutup (Loop)", "ok");
+      
+      // ─── FITUR POPUP CONTINUOUS LOOP ───
+      const isContinuous = confirm("Jalur telah terhubung!\n\nApakah Anda ingin mengatur rute ini menjadi CONTINUOUS (Robot akan terus berputar tanpa henti)?");
+      
+      if (isContinuous) {
+          // Kirim perintah aktifkan loop ke ROS
+          sw({ cmd: 'enable_loop' });
+          console.log("Continuous Loop Aktif");
+          log("Jalur Loop + Patroli Continuous AKTIF", "ok");
+      } else {
+          // Kirim perintah nonaktifkan loop ke ROS (hanya 1 putaran)
+          sw({ cmd: 'disable_loop' });
+          console.log("Single Loop Aktif");
+          log("Jalur Loop (Hanya 1 Putaran)", "in");
+      }
     }
 
     function sendPath() {
